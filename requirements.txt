@@ -1,12 +1,7 @@
 yfinance
 streamlit
 pandas
-beautifulsoup4
-selenium
 lxml
 openpyxl
 XlsxWriter
-chromedriver-autoinstaller
-chromium
-chromium-browser
-chromedriver
+
