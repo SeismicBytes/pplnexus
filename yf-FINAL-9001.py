@@ -5,319 +5,440 @@ import base64
 from io import BytesIO
 from PIL import Image
 import math
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.options import Options
-import time
+import logging # Use logging for cleaner error/info messages
 
-def login_to_firewall():
-    # Configure Chrome options to handle SSL certificate errors
-    chrome_options = Options()
-    chrome_options.add_argument('--ignore-certificate-errors')
-    chrome_options.add_argument('--ignore-ssl-errors')
-    chrome_options.add_argument('--start-maximized')
+# --- Configuration ---
+# Use logging instead of just print/st.error for more structured output
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-    # Add this option to prevent the browser from closing
-    chrome_options.add_experimental_option("detach", True)
+# Constants for file paths and default values
+LOGO_PATH = "ppl_logo.jpg"
+BACKGROUND_PATH = "wp.jpg"
+DEFAULT_TICKERS = "GOOGL,AAPL,MSFT,AMZN" # Example default tickers
+FINANCIAL_COLUMNS_TO_SELECT = [
+    # Profile Info (Merged)
+    'Ticker', 'LongName', 'Long_Business_Summary', 'Country', 'Sector', 'Industry',
+    'Full_Time_Employees', 'Website', 'Phone',
+    # Financial Info
+    'Full_Date', 'Year_Index', 'Currency', 'Financial_Currency',
+    # Key Financial Metrics (Ensure these match yfinance output)
+    'Total Revenue', 'Operating Revenue', 'Cost Of Revenue', 'Gross Profit',
+    'Operating Expense', 'Selling General and Administrative', # Often listed under Operating Expense
+    'Selling General And Administration', # Check if yfinance uses this exact name
+    'Operating Income', 'EBIT', 'Normalized EBITDA', # EBIT/EBITDA might not always be directly available or need calculation
+    'Net Income'
+]
 
-    # Initialize the Chrome driver with options
-    driver = webdriver.Chrome(options=chrome_options)
+# --- Helper Functions ---
 
+def set_background(image_file: str):
+    """Sets the background image for the Streamlit app."""
     try:
-        # Navigate to the login page
-        driver.get("https://10.1.1.1:4443/sonicui/7/login/#/")
-
-        # Wait for the username field to be present using the correct class name
-        username_field = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "input[name='username']"))
+        with open(image_file, "rb") as file:
+            encoded_string = base64.b64encode(file.read()).decode()
+        st.markdown(
+            f"""
+            <style>
+            .stApp {{
+                background-image: url(data:image/png;base64,{encoded_string});
+                background-size: cover;
+                background-repeat: no-repeat;
+                background-attachment: fixed; /* Keeps background fixed during scroll */
+            }}
+            /* Make headers slightly transparent white for better visibility */
+            h1, h2, h3, h4, h5, h6 {{
+                 color: white;
+                 background-color: rgba(0, 0, 0, 0.3); /* Slight dark overlay */
+                 padding: 5px;
+                 border-radius: 5px;
+            }}
+             /* Style buttons */
+            .stButton>button {{
+                color: #4F8BF9; /* Button text color */
+                background-color: #FFFFFF; /* Button background color */
+                border: 1px solid #4F8BF9; /* Button border */
+                border-radius: 5px;
+                padding: 0.5em 1em;
+            }}
+            .stButton>button:hover {{
+                background-color: #E6E6E6; /* Slightly darker on hover */
+                color: #3F6EBD;
+                border-color: #3F6EBD;
+            }}
+            /* Style text input/area */
+            .stTextInput>div>div>input, .stTextArea>div>div>textarea {{
+                background-color: rgba(255, 255, 255, 0.9); /* Slightly transparent white */
+                border-radius: 5px;
+            }}
+             /* Style dataframes */
+            .stDataFrame {{
+                 background-color: rgba(255, 255, 255, 0.9);
+                 border-radius: 5px;
+            }}
+            </style>
+            """,
+            unsafe_allow_html=True
         )
-
-        # Find password field using the correct class name
-        password_field = driver.find_element(By.CSS_SELECTOR, "input[name='password']")
-
-        # Enter fixed credentials
-        username_field.send_keys("ci-pteam")
-        password_field.send_keys("C!-pte@m#2()22")
-
-        # Find and click the login button using the correct class
-        login_button = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, "div.sw-login__trigger"))
-        )
-        login_button.click()
-
-        # Wait for and click the Continue button
-        continue_button = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Continue')]"))
-        )
-        continue_button.click()
-
-        # Wait for successful login
-        time.sleep(5)  # Adding a fixed wait time to ensure page loads
-
-        st.success("Successfully logged in!")
-
+        logging.info(f"Background image '{image_file}' set successfully.")
+    except FileNotFoundError:
+        st.error(f"Background image file not found: {image_file}")
+        logging.error(f"Background image file not found: {image_file}")
     except Exception as e:
-        st.error(f"An error occurred: {str(e)}")
+        st.error(f"Error setting background: {e}")
+        logging.error(f"Error setting background: {e}")
 
-def set_background(image_file):
-    with open(image_file, "rb") as image_file:
-        encoded_string = base64.b64encode(image_file.read()).decode()
-    st.markdown(
-        f"""
-        <style>
-        .stApp {{
-            background-image: url(data:image/png;base64,{encoded_string});
-            background-size: cover;
-        }}
-        </style>
-        """,
-        unsafe_allow_html=True
-    )
+def get_financial_data(ticker: str) -> pd.DataFrame:
+    """
+    Fetches annual and TTM financial data for a given stock ticker using yfinance.
 
-def get_financial_data(ticker):
+    Args:
+        ticker: The stock ticker symbol (e.g., "AAPL").
+
+    Returns:
+        A pandas DataFrame containing financial data, including a TTM row.
+        Returns a DataFrame with only the 'Ticker' column if an error occurs.
+    """
     try:
-        # Initialize ticker object
+        logging.info(f"Fetching financial data for {ticker}...")
         stock = yf.Ticker(ticker)
+        info = stock.info # Fetch info once
 
-        # Get annual financial data
+        # --- Annual Data ---
         financials = stock.financials
         if financials.empty:
+            st.warning(f"No annual financial data found for {ticker}.")
             return pd.DataFrame({'Ticker': [ticker]})
-        # Transpose so that rows become dates
-        df = financials.T.copy()
+
+        df = financials.T.copy() # Transpose for years as rows
         df['Ticker'] = ticker
+        df['Full_Date'] = pd.to_datetime(df.index).strftime('%Y-%m-%d') # Format date
+        df = df.reset_index(drop=True)
+        df['Year_Index'] = df.index + 1 # Annual rows start from 1
 
-        # Add date information
-        df['Full_Date'] = df.index
-        # We will reset Year_Index later so that annual rows start from 1
+        # Add currency info from general info
+        df['Currency'] = info.get('currency', 'N/A')
+        df['Financial_Currency'] = info.get('financialCurrency', 'N/A')
 
-        # Get currency information from info
-        info = stock.info
-        df['Currency'] = info.get('currency', 'Unknown')
-        df['Financial_Currency'] = info.get('financialCurrency', 'Unknown')
-
-        # Compute TTM row from quarterly_financials if available
+        # --- TTM Data ---
         q_financials = stock.quarterly_financials
-        if (not q_financials.empty) and (q_financials.shape[1] >= 4):
-            # Sum the first four quarters for each metric.
-            # (If needed, adjust the ordering so you use the latest four quarters.)
-            ttm_series = q_financials.iloc[:, :4].sum(axis=1)
-            # Only include metrics that appear in the annual data
-            common_metrics = [metric for metric in df.columns if metric in ttm_series.index]
-            ttm_data = {metric: ttm_series[metric] for metric in common_metrics}
+        ttm_data = {'Ticker': ticker, 'Full_Date': "TTM", 'Year_Index': 0}
+        ttm_data['Currency'] = info.get('currency', 'N/A')
+        ttm_data['Financial_Currency'] = info.get('financialCurrency', 'N/A')
+
+        if not q_financials.empty and q_financials.shape[1] >= 4:
+            # Sum the latest four quarters for TTM
+            ttm_series = q_financials.iloc[:, :4].sum(axis=1, numeric_only=True)
+            # Include only metrics present in the annual data columns
+            common_metrics = df.columns.intersection(ttm_series.index)
+            for metric in common_metrics:
+                 if metric not in ttm_data: # Avoid overwriting Ticker, Date etc.
+                    ttm_data[metric] = ttm_series.get(metric) # Use .get for safety
         else:
-            # If quarterly data is not available, set financial metrics to None
-            ttm_data = {metric: None for metric in df.columns if metric not in ['Ticker', 'Full_Date', 'Currency', 'Financial_Currency']}
+            st.info(f"Insufficient quarterly data to calculate TTM for {ticker}. TTM financial values set to None.")
+            # Set financial metrics to None if TTM cannot be calculated
+            financial_metrics = [col for col in df.columns if col not in ['Ticker', 'Full_Date', 'Year_Index', 'Currency', 'Financial_Currency']]
+            for metric in financial_metrics:
+                ttm_data[metric] = None
 
-        # Add the extra columns for TTM row
-        ttm_data['Ticker'] = ticker
-        ttm_data['Full_Date'] = "TTM"
-        # Currency fields from the same info as above
-        ttm_data['Currency'] = info.get('currency', 'Unknown')
-        ttm_data['Financial_Currency'] = info.get('financialCurrency', 'Unknown')
-
-        # Create a DataFrame for the TTM row
         ttm_df = pd.DataFrame([ttm_data])
 
-        # Re-index the annual rows so that their Year_Index starts from 1
-        df = df.reset_index(drop=True)
-        df['Year_Index'] = df.index + 1
+        # Combine TTM and annual data
+        final_df = pd.concat([ttm_df, df], ignore_index=True, sort=False) # Ensure TTM is first
 
-        # Set TTM row’s Year_Index to 0
-        ttm_df['Year_Index'] = 0
-
-        # Concatenate TTM row at the top
-        final_df = pd.concat([ttm_df, df], ignore_index=True)
-
+        logging.info(f"Successfully fetched financial data for {ticker}.")
         return final_df
 
     except Exception as e:
         st.warning(f"Error getting financial data for {ticker}: {e}")
+        logging.warning(f"Error getting financial data for {ticker}: {e}")
+        # Return a minimal DataFrame to allow merging later
         return pd.DataFrame({'Ticker': [ticker]})
 
-def get_profile_data(ticker):
+def get_profile_data(ticker: str) -> pd.DataFrame:
+    """
+    Fetches company profile data for a given stock ticker using yfinance.
+
+    Args:
+        ticker: The stock ticker symbol (e.g., "AAPL").
+
+    Returns:
+        A pandas DataFrame containing profile data.
+        Returns a DataFrame with only the 'Ticker' column if an error occurs.
+    """
     try:
-        # Initialize ticker object
+        logging.info(f"Fetching profile data for {ticker}...")
         stock = yf.Ticker(ticker)
         info = stock.info
 
+        # Use .get() with default values for robustness
         company_info = {
             'Ticker': ticker,
-            'LongName': info.get('longName', ''),
-            'Long_Business_Summary': info.get('longBusinessSummary', ''),
-            'Country': info.get('country', 'Not Found'),
-            'Sector': info.get('sector', ''),
-            'Industry': info.get('industry', ''),
-            'Full_Time_Employees': str(info.get('fullTimeEmployees', '')),
-            'Website': info.get('website', ''),
-            'Phone': info.get('phone', '')
+            'LongName': info.get('longName', 'N/A'),
+            'Long_Business_Summary': info.get('longBusinessSummary', 'N/A'),
+            'Country': info.get('country', 'N/A'),
+            'Sector': info.get('sector', 'N/A'),
+            'Industry': info.get('industry', 'N/A'),
+            'Full_Time_Employees': info.get('fullTimeEmployees', 'N/A'), # Keep as is or try converting to int/str
+            'Website': info.get('website', 'N/A'),
+            'Phone': info.get('phone', 'N/A')
         }
+        # Convert employees to string for consistent display, handling None/missing
+        company_info['Full_Time_Employees'] = str(company_info['Full_Time_Employees']) if company_info['Full_Time_Employees'] != 'N/A' else 'N/A'
 
+
+        logging.info(f"Successfully fetched profile data for {ticker}.")
         return pd.DataFrame([company_info])
+
     except Exception as e:
         st.warning(f"Error getting profile data for {ticker}: {e}")
+        logging.warning(f"Error getting profile data for {ticker}: {e}")
+        # Return a minimal DataFrame to allow merging later
         return pd.DataFrame({'Ticker': [ticker]})
-    
-# Streamlit app setup
-st.set_page_config(page_title="Phronesis Pulse 2.0", layout="wide")
 
-# Set background image
-set_background('wp.jpg')
+def create_excel_download(df: pd.DataFrame, filename: str) -> bytes:
+    """Creates an Excel file in memory for downloading."""
+    output = BytesIO()
+    # Use ExcelWriter to potentially add more sheets or formatting later
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False, sheet_name='Data')
+        # Optional: Auto-adjust column widths (can be slow for large data)
+        # worksheet = writer.sheets['Data']
+        # for i, col in enumerate(df.columns):
+        #     column_len = max(df[col].astype(str).map(len).max(), len(col)) + 2
+        #     worksheet.set_column(i, i, column_len)
+    return output.getvalue()
 
-# Header layout with three columns
-col1, col2, col3 = st.columns([1, 4, 1])
+# --- Streamlit App ---
 
-with col1:
+# Page Configuration (do this first)
+st.set_page_config(
+    page_title="Phronesis Pulse 2.0",
+    page_icon="📊", # Add a relevant emoji icon
+    layout="wide"
+)
+
+# Apply background image
+set_background(BACKGROUND_PATH)
+
+# --- Header ---
+col_logo, col_title = st.columns([1, 5]) # Adjust ratio as needed
+
+with col_logo:
     try:
-        logo = Image.open("ppl_logo.jpg")
-        st.image(logo, width=100)
+        logo = Image.open(LOGO_PATH)
+        st.image(logo, width=120) # Slightly larger logo
     except FileNotFoundError:
-        st.error("Logo image not found. Please make sure 'ppl_logo.jpg' is in the same directory.")
+        st.error(f"Logo image not found: {LOGO_PATH}")
+        logging.error(f"Logo image not found: {LOGO_PATH}")
+    except Exception as e:
+        st.error(f"Error loading logo: {e}")
+        logging.error(f"Error loading logo: {e}")
 
-with col2:
-    st.markdown("<h1 style='text-align: center; color: white;'>Phronesis Pulse 2.0</h1>", unsafe_allow_html=True)
 
-with col3:
-    if st.button("Login to Firewall", key="firewall_login"):
-        with st.spinner("Logging into firewall..."):
-            login_to_firewall()
+with col_title:
+    st.markdown("<h1 style='text-align: center; margin-top: 20px;'>Phronesis Pulse 2.0</h1>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: center; color: lightgrey;'>Financial Data Extractor</p>", unsafe_allow_html=True)
 
-# Initialize session state
+
+st.markdown("---") # Visual separator
+
+# --- Initialize Session State ---
 if 'tickers' not in st.session_state:
     st.session_state.tickers = []
+if 'processed_data' not in st.session_state:
+    st.session_state.processed_data = pd.DataFrame()
+if 'all_extracted_data' not in st.session_state:
+    st.session_state.all_extracted_data = pd.DataFrame()
 
-# Ticker input
-ticker_input = st.text_area("Enter tickers (comma-separated & without spaces)", "GOOGL,AAPL,ARTNA")
 
-if st.button("Submit Tickers"):
-    st.session_state.tickers = [ticker.strip() for ticker in ticker_input.split(',')]
-    st.success(f"Tickers submitted: {len(st.session_state.tickers)}")
+# --- Ticker Input Area ---
+st.subheader("1. Enter Stock Tickers")
+ticker_input = st.text_area(
+    "Enter ticker symbols separated by commas (e.g., GOOGL,AAPL,MSFT). Avoid spaces.",
+    value=DEFAULT_TICKERS,
+    height=100,
+    key="ticker_input_area" # Unique key for the widget
+)
 
-st.write(f"Number of tickers submitted: {len(st.session_state.tickers)}")
+if st.button("Load Tickers", key="load_tickers_button"):
+    # Basic validation: split, strip whitespace, remove empty strings
+    tickers_raw = [ticker.strip().upper() for ticker in ticker_input.split(',') if ticker.strip()]
+    if tickers_raw:
+        st.session_state.tickers = tickers_raw
+        st.success(f"{len(st.session_state.tickers)} tickers loaded: {', '.join(st.session_state.tickers)}")
+        # Clear previous results when new tickers are loaded
+        st.session_state.processed_data = pd.DataFrame()
+        st.session_state.all_extracted_data = pd.DataFrame()
+    else:
+        st.warning("Please enter valid ticker symbols.")
+        st.session_state.tickers = [] # Clear if input is invalid
 
+
+# --- Data Extraction Section ---
 if st.session_state.tickers:
-    max_tickers_per_batch = st.slider("Select the maximum number of tickers per batch", 
-                                     1, len(st.session_state.tickers), 
-                                     min(10, len(st.session_state.tickers)))
+    st.markdown("---")
+    st.subheader("2. Configure and Extract Data")
 
-    num_batches = math.ceil(len(st.session_state.tickers) / max_tickers_per_batch)
-    num_batches = min(num_batches, 3)
+    # Batch size selection (optional, consider removing if not strictly needed or if ticker list is usually small)
+    # max_tickers_per_batch = st.slider(
+    #     "Select maximum tickers per processing batch (if needed)",
+    #     1, len(st.session_state.tickers),
+    #     min(10, len(st.session_state.tickers)), # Default to 10 or total, whichever is smaller
+    #     key="batch_slider"
+    # )
+    # num_batches = math.ceil(len(st.session_state.tickers) / max_tickers_per_batch)
 
-    if st.button("Extract Data"):
+    if st.button("Extract Financial Data", key="extract_data_button"):
         all_financial_dfs = []
         all_profile_dfs = []
+        failed_tickers = []
+        total_tickers_to_process = len(st.session_state.tickers)
 
-        for batch in range(num_batches):
-            start_idx = batch * max_tickers_per_batch
-            end_idx = min((batch + 1) * max_tickers_per_batch, len(st.session_state.tickers))
-            batch_tickers = st.session_state.tickers[start_idx:end_idx]
+        st.info(f"Starting data extraction for {total_tickers_to_process} tickers...")
+        progress_bar = st.progress(0)
+        status_text = st.empty() # Placeholder for status updates
 
-            st.subheader(f"Processing Batch {batch + 1}")
+        # Process all tickers in one go (removed batching for simplicity unless necessary)
+        for i, ticker in enumerate(st.session_state.tickers):
+            status_text.text(f"Processing {ticker} ({i+1}/{total_tickers_to_process})...")
 
-            financial_dfs = []
-            profile_dfs = []
+            profile_df = get_profile_data(ticker)
+            financial_df = get_financial_data(ticker)
 
-            progress_bar = st.progress(0)
-            status_text = st.empty()
+            # Check if data fetching was successful (minimal df indicates failure)
+            if len(profile_df.columns) > 1: # More than just 'Ticker'
+                 all_profile_dfs.append(profile_df)
+            else:
+                 failed_tickers.append(f"{ticker} (profile)")
 
-            total_tickers = len(batch_tickers)
+            if len(financial_df.columns) > 1: # More than just 'Ticker'
+                all_financial_dfs.append(financial_df)
+            # No separate else for financial, as profile failure is more critical for merge
+            elif f"{ticker} (profile)" not in failed_tickers: # Avoid double counting if profile also failed
+                 failed_tickers.append(f"{ticker} (financial)")
 
-            for i, ticker in enumerate(batch_tickers):
-                status_text.text(f"Extracting data for {ticker}...")
-                financial_df = get_financial_data(ticker)
-                profile_df = get_profile_data(ticker)
-                financial_dfs.append(financial_df)
-                profile_dfs.append(profile_df)
 
-                progress = (i + 1) / total_tickers
-                progress_bar.progress(progress)
-                status_text.text(f"{i+1}/{total_tickers} tickers processed ({progress*100:.0f}%)")
+            # Update progress
+            progress = (i + 1) / total_tickers_to_process
+            progress_bar.progress(progress)
 
-            combined_financial_df = pd.concat(financial_dfs, ignore_index=True)
-            combined_profile_df = pd.concat(profile_dfs, ignore_index=True)
+        status_text.success(f"Data extraction complete for {total_tickers_to_process} tickers.")
+        progress_bar.empty() # Remove progress bar after completion
 
-            final_df = pd.merge(combined_profile_df, combined_financial_df, on='Ticker', how='outer')
+        if failed_tickers:
+            st.warning(f"Could not retrieve complete data for: {', '.join(failed_tickers)}")
 
-            columns_to_select = [
-                'Ticker', 'Full_Date', 'Year_Index', 'LongName', 'Long_Business_Summary',
-                'Currency', 'Financial_Currency', 'Sector', 'Industry',
-                'Full_Time_Employees', 'Website', 'Phone', 'Country',
-                'Total Revenue', 'Operating Revenue', 'Gross Profit',
-                'Operating Expense', 'Selling General and Administrative',
-                'EBIT', 'Normalized EBITDA', 'Operating Income',
-                'Net Income','Selling General And Administration','Cost Of Revenue'
+        if not all_profile_dfs or not all_financial_dfs:
+            st.error("No data could be extracted. Please check tickers and network connection.")
+            st.session_state.processed_data = pd.DataFrame()
+            st.session_state.all_extracted_data = pd.DataFrame()
+        else:
+            # --- Consolidate and Process Data ---
+            st.markdown("---")
+            st.subheader("3. Processed Results")
 
-            ]
+            # Combine all successfully fetched dataframes
+            combined_profile_df = pd.concat(all_profile_dfs, ignore_index=True)
+            combined_financial_df = pd.concat(all_financial_dfs, ignore_index=True)
 
-            existing_columns = [col for col in columns_to_select if col in final_df.columns]
-            Final_DT = final_df[existing_columns]
+            # Merge profile and financial data
+            # Use 'outer' merge to keep tickers even if one part failed, though checks above should minimize this
+            final_df = pd.merge(combined_profile_df, combined_financial_df, on='Ticker', how='inner') # Use 'inner' if both profile and financial are required
 
-            st.dataframe(Final_DT)
+            if final_df.empty:
+                st.error("Data merging resulted in an empty DataFrame. Check fetched data.")
+                st.session_state.processed_data = pd.DataFrame()
+                st.session_state.all_extracted_data = pd.DataFrame()
 
-            # Download buttons for current batch
-            output = BytesIO()
-            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                Final_DT.to_excel(writer, index=False, sheet_name='Sheet1')
-            processed_data = output.getvalue()
+            else:
+                # Store the full merged data before selecting columns
+                st.session_state.all_extracted_data = final_df.copy()
 
-            st.download_button(
-                label=f"Download Displayed Columns (Batch {batch + 1})",
-                data=processed_data,
-                file_name=f'Pulse_yf_FormattedData_Batch{batch + 1}.xlsx',
-                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                # Select and Order Display Columns
+                # Get columns that actually exist in the merged dataframe
+                existing_display_columns = [col for col in FINANCIAL_COLUMNS_TO_SELECT if col in final_df.columns]
+                missing_display_columns = [col for col in FINANCIAL_COLUMNS_TO_SELECT if col not in final_df.columns]
+
+                if missing_display_columns:
+                     st.info(f"Note: The following requested columns were not found in the data and will be omitted: {', '.join(missing_display_columns)}")
+
+                # Create the display dataframe
+                final_display_dt = final_df[existing_display_columns]
+
+                # Store the processed data for display
+                st.session_state.processed_data = final_display_dt
+
+# --- Display Results and Download ---
+if not st.session_state.processed_data.empty:
+    st.markdown("---")
+    st.subheader("4. View and Download Data")
+
+    st.dataframe(st.session_state.processed_data)
+
+    # --- Download Buttons ---
+    col_dl1, col_dl2 = st.columns(2)
+
+    with col_dl1:
+        # Download Button for Displayed/Formatted Data
+        try:
+            excel_display_data = create_excel_download(
+                st.session_state.processed_data,
+                "Pulse_yf_FormattedData.xlsx"
             )
+            st.download_button(
+                label="📥 Download Displayed Data (Excel)",
+                data=excel_display_data,
+                file_name='Pulse_yf_FormattedData.xlsx',
+                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                key="download_display_button"
+            )
+        except Exception as e:
+            st.error(f"Error creating displayed data download file: {e}")
+            logging.error(f"Error creating displayed data download file: {e}")
 
-            all_financial_dfs.extend(financial_dfs)
-            all_profile_dfs.extend(profile_dfs)
 
-        # Consolidate all batches
-# --- Consolidated Results Section ---
-        st.subheader("Consolidated Results")
-        combined_financial_df = pd.concat(all_financial_dfs, ignore_index=True)
-        combined_profile_df = pd.concat(all_profile_dfs, ignore_index=True)
+    with col_dl2:
+       # Download Button for All Extracted Data
+       if not st.session_state.all_extracted_data.empty:
+            try:
+                # Optional: Reorder columns for the "All Data" file (display columns first)
+                all_cols = st.session_state.all_extracted_data.columns.tolist()
+                ordered_cols = [col for col in FINANCIAL_COLUMNS_TO_SELECT if col in all_cols] + \
+                               [col for col in all_cols if col not in FINANCIAL_COLUMNS_TO_SELECT]
+                all_data_ordered = st.session_state.all_extracted_data[ordered_cols]
 
-        final_df = pd.merge(combined_profile_df, combined_financial_df, on='Ticker', how='outer')
+                excel_all_data = create_excel_download(
+                    all_data_ordered, # Use the reordered dataframe
+                    "Pulse_yf_AllExtractedData.xlsx"
+                )
+                st.download_button(
+                    label="📦 Download All Extracted Data (Excel)",
+                    data=excel_all_data,
+                    file_name='Pulse_yf_AllExtractedData.xlsx',
+                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                    key="download_all_button"
+                )
+            except Exception as e:
+                 st.error(f"Error creating all data download file: {e}")
+                 logging.error(f"Error creating all data download file: {e}")
 
-        # Use only the columns_to_select for displayed columns (unchanged)
-        existing_columns = [col for col in columns_to_select if col in final_df.columns]
-        Final_DT = final_df[existing_columns]
-        st.dataframe(Final_DT)
 
-        # Download consolidated displayed columns (unchanged)
-        output = BytesIO()
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            Final_DT.to_excel(writer, index=False, sheet_name='Sheet1')
-        processed_data = output.getvalue()
+    # --- Summary Statistics ---
+    st.markdown("---")
+    st.subheader("Extraction Summary")
+    total_submitted = len(st.session_state.tickers)
+    successful_tickers = st.session_state.processed_data['Ticker'].nunique() # Count unique tickers in the final display DF
+    failed_count = total_submitted - successful_tickers
 
-        st.download_button(
-            label="Download Consolidated Displayed Columns",
-            data=processed_data,
-            file_name='Pulse_yf_FormattedData_Consolidated.xlsx',
-            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        )
+    st.metric("Tickers Submitted", total_submitted)
+    st.metric("Tickers Successfully Processed", successful_tickers)
+    st.metric("Tickers with Issues", failed_count)
 
-        # Reorder final_df columns:
-        ordered_columns = [col for col in columns_to_select if col in final_df.columns] + \
-                        [col for col in final_df.columns if col not in columns_to_select]
-        final_df_ordered = final_df[ordered_columns]
+elif 'tickers' in st.session_state and st.session_state.tickers:
+    # Show this only if tickers are loaded but no data is processed yet
+    # (or if processing failed completely)
+    st.info("Click 'Extract Financial Data' to begin.")
 
-        # Download all extracted data file with the reordered columns:
-        output = BytesIO()
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            final_df_ordered.to_excel(writer, index=False, sheet_name='Sheet1')
-        processed_data = output.getvalue()
-
-        st.download_button(
-            label="Download All Extracted Data (Consolidated)",
-            data=processed_data,
-            file_name='Pulse_yf_AllData_Consolidated.xlsx',
-            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        )
-
-        # Summary statistics
-        st.subheader("Summary Statistics")
-        st.write(f"Total tickers processed: {len(st.session_state.tickers)}")
-        st.write(f"Successful extractions: {len(Final_DT)}")
-        st.write(f"Failed extractions: {len(st.session_state.tickers) - len(Final_DT)}")
+# Optional: Footer
+st.markdown("---")
+st.markdown("<p style='text-align: center; color: grey; font-size: small;'>Phronesis Pulse v2.0 - Powered by yfinance and Streamlit</p>", unsafe_allow_html=True)
